@@ -10,16 +10,19 @@ lspci -n -s 00:14.0 2>/dev/null | grep -q '8086:1f41' || { echo "No Intel I354 a
 
 install -m 0755 vc520-ports         /usr/local/sbin/vc520-ports
 install -m 0644 vc520-ports.service /etc/systemd/system/vc520-ports.service
+install -m 0644 vc520-media.service /etc/systemd/system/vc520-media.service
 install -d /usr/local/share/doc/vc520-ports
 install -m 0644 README.md           /usr/local/share/doc/vc520-ports/README.md
 install -m 0644 vc520-ports.default /etc/default/vc520-ports.example
 [ -f /etc/default/vc520-ports ] || install -m 0644 vc520-ports.default /etc/default/vc520-ports
 
 systemctl daemon-reload
-systemctl enable vc520-ports.service
+systemctl enable vc520-ports.service vc520-media.service
 echo "installed vc520-ports $(/usr/local/sbin/vc520-ports --version)"
+systemctl is-active --quiet vc520-media.service && systemctl restart vc520-media.service || true
 if [ "${1:-}" = "--now" ]; then
   systemctl start vc520-ports.service
+  systemctl restart vc520-media.service
   systemctl --no-pager status vc520-ports.service | head -20
   ip -br link
 fi

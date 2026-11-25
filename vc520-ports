@@ -30,9 +30,9 @@ path is 00:14.1 (= eth2); 'status --force' briefly unbinds eth2 to read it.
 
 Config: /etc/default/vc520-ports
 """
-import argparse, mmap, os, struct, sys, time, syslog
+import argparse, json, mmap, os, re, struct, subprocess, sys, time, syslog
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEV = "/sys/bus/pci/devices/0000:00:14.{}"
 IGB = "/sys/bus/pci/drivers/igb"
 I350_PORT0 = "/sys/bus/pci/devices/0000:04:00.0"
@@ -44,10 +44,20 @@ LINK_MODE_MASK, LINK_MODE_KX, I2C_ENA = 0x00C00000, 0x00400000, 0x02000000
 MDICNFG_SHARED = 0xC0000000                          # external + common MDIO
 G1, G2 = 0x1B, 0x1C
 
+# I350 combo ports (GEx RJ45 on internal copper PHY / SFPx on SerDes)
+I350_PORTS = ("0000:04:00.0", "0000:04:00.1")
+CONNSW, CONNSW_PHY_PDN = 0x34, 0x800
+LINK_MODE_SERDES = 0x00C00000                          # 11 = SerDes (SFP), 00 = internal copper
+SFP_ABSENT_BIT = 18                                    # CTRL.SDP0: 1 = no module (MOD_ABS)
+
 DEFAULTS = {
-    "BIND_FNS": "1 0 2",
+    "BIND_FNS": "1 0",
     # final interface names by PCI address (applied after binding, any boot order)
-    "NAMES": "0000:04:00.0=eth0 0000:04:00.1=eth1 0000:00:14.1=eth2 0000:00:14.0=eth3 0000:00:14.2=eth4",
+    "NAMES": "0000:04:00.0=eth0 0000:04:00.1=eth1 0000:00:14.1=eth2 0000:00:14.0=eth3",
+    # GE1/SFP1 + GE2/SFP2 combo ports (I350): auto | sfp | copper
+    #   auto = SFP module present -> SFP (SerDes), cage empty -> GE RJ45 (copper PHY)
+    "GE_MEDIA": "eth0=auto eth1=sfp",
+    "MEDIA_POLL": "3",
     # name:fn:MDICNFG  - the I354 port whose MDIO bus reaches the switch
     "SWITCHES": "A:0:0xc0000000 B:1:0x80000000",
     # alternate management path used once the switch's own port is bound
@@ -96,6 +106,15 @@ class Cfg:
         for item in raw.get("NAMES", "").split():
             bdf, n = item.split("=")
             self.names.append((bdf if bdf.startswith("0000:") else "0000:" + bdf, n))
+        names = {n: b for b, n in self.names}
+        self.media = {}
+        for item in raw.get("GE_MEDIA", "").split():
+            n, pol = item.split("=")
+            bdf = names.get(n, n if n.startswith("0000:") else None)
+            if bdf not in I350_PORTS or pol not in ("auto", "sfp", "copper"):
+                die(f"GE_MEDIA: bad entry {item!r} (use eth0/eth1 = auto|sfp|copper)")
+            self.media[bdf] = pol
+        self.media_poll = float(raw.get("MEDIA_POLL", "3"))
         self.labels = {}
         for name in self.switches:
             lab = {p: f"port{p}" for p in range(7)}
@@ -361,6 +380,267 @@ def apply_names(cfg):
         log(f"renamed {cur} -> {want} ({bdf})")
 
 
+# ---------------------------------------------------------------- GE / SFP media (I350)
+class PciBar:
+    def __init__(self, bdf):
+        if os.path.exists(f"/sys/bus/pci/devices/{bdf}/driver"):
+            raise RuntimeError(f"{bdf} is bound; registers not accessible")
+        self.fd = os.open(f"/sys/bus/pci/devices/{bdf}/resource0", os.O_RDWR | os.O_SYNC)
+        self.m = mmap.mmap(self.fd, 0x20000)
+
+    def rd(self, o):
+        return struct.unpack_from("<I", self.m, o)[0]
+
+    def wr(self, o, v):
+        struct.pack_into("<I", self.m, o, v)
+
+    def close(self):
+        self.m.close()
+        os.close(self.fd)
+
+
+def sh(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def i350_ctrl(bdf):
+    """CTRL register: via 'ethtool -d' while bound, direct BAR read while unbound."""
+    ifn = pci_netdev(bdf)
+    if ifn:
+        mt = re.search(r"CTRL \(.*?\)\s+0x([0-9A-Fa-f]+)", sh("ethtool", "-d", ifn).stdout)
+        return int(mt.group(1), 16) if mt else None
+    try:
+        b = PciBar(bdf)
+        v = b.rd(0)
+        b.close()
+        return v
+    except Exception:
+        return None
+
+
+def sfp_present(bdf):
+    c = i350_ctrl(bdf)
+    return None if c is None else not (c >> SFP_ABSENT_BIT) & 1
+
+
+def current_media(bdf):
+    ifn = pci_netdev(bdf)
+    if not ifn:
+        return None
+    out = sh("ethtool", ifn).stdout
+    if "Port: FIBRE" in out:
+        return "sfp"
+    if "Port: Twisted Pair" in out:
+        return "copper"
+    return None
+
+
+def has_link(bdf):
+    ifn = pci_netdev(bdf)
+    return bool(ifn) and "Link detected: yes" in sh("ethtool", ifn).stdout
+
+
+def wanted_media(pol, present):
+    if pol in ("sfp", "copper"):
+        return pol
+    return "sfp" if present else "copper"
+
+
+def ipj(*args):
+    r = sh("ip", "-j", *args)
+    try:
+        return json.loads(r.stdout or "[]")
+    except ValueError:
+        return []
+
+
+def _addrs(dev):
+    out = []
+    for l in ipj("addr", "show", "dev", dev):
+        for a in l.get("addr_info", []):
+            if a.get("family") == "inet6" and a.get("local", "").startswith("fe80"):
+                continue
+            out.append(a)
+    return out
+
+
+def _routes(dev):
+    out = []
+    for fam in ("-4", "-6"):
+        for r in ipj(fam, "route", "show", "table", "all", "dev", dev):
+            if r.get("protocol") == "kernel" or r.get("type", "unicast") != "unicast":
+                continue
+            if r.get("dst", "").startswith("fe80"):
+                continue
+            r["_fam"] = fam
+            out.append(r)
+    return out
+
+
+def save_netcfg(ifn):
+    """Snapshot addresses, routes and VLAN children - they vanish when the port is rebound."""
+    def one(dev):
+        l = (ipj("link", "show", "dev", dev) or [{}])[0]
+        return {"dev": dev, "up": is_up(dev), "mtu": l.get("mtu"),
+                "addrs": _addrs(dev), "routes": _routes(dev)}
+    snap = one(ifn)
+    snap["vlans"] = []
+    for l in ipj("-d", "link", "show"):
+        li = l.get("linkinfo", {})
+        if l.get("link") == ifn and li.get("info_kind") == "vlan":
+            v = one(l["ifname"])
+            v["id"] = li.get("info_data", {}).get("id")
+            snap["vlans"].append(v)
+    return snap
+
+
+def restore_netcfg(snap, ifn):
+    def quiet(*cmd):
+        r = sh(*cmd)
+        if r.returncode and "File exists" not in r.stderr:
+            log(f"  restore: {' '.join(cmd)}: {r.stderr.strip()}", err=True)
+
+    def addrs(dev, lst):
+        for a in lst:
+            cmd = ["ip", "addr", "replace", f"{a['local']}/{a['prefixlen']}", "dev", dev]
+            if a.get("broadcast"):
+                cmd += ["broadcast", a["broadcast"]]
+            v, p = a.get("valid_life_time"), a.get("preferred_life_time")
+            if v is not None and v < 4294967295:
+                cmd += ["valid_lft", str(v), "preferred_lft", str(min(p or v, v))]
+            quiet(*cmd)
+
+    def routes(dev, lst):
+        for r in lst:
+            cmd = ["ip", r["_fam"], "route", "replace", r.get("dst", "default")]
+            if r.get("gateway"):
+                cmd += ["via", r["gateway"]]
+            cmd += ["dev", dev]
+            if r.get("protocol"):
+                cmd += ["proto", str(r["protocol"])]
+            if r.get("metric") is not None:
+                cmd += ["metric", str(r["metric"])]
+            if r.get("table") not in (None, "main"):
+                cmd += ["table", str(r["table"])]
+            if r.get("prefsrc"):
+                cmd += ["src", r["prefsrc"]]
+            if r.get("scope") not in (None, "global", "universe"):
+                cmd += ["scope", str(r["scope"])]
+            quiet(*cmd)
+
+    if snap.get("mtu"):
+        quiet("ip", "link", "set", ifn, "mtu", str(snap["mtu"]))
+    if snap["up"]:
+        quiet("ip", "link", "set", ifn, "up")
+    addrs(ifn, snap["addrs"])
+    for v in snap["vlans"]:
+        quiet("ip", "link", "add", "link", ifn, "name", v["dev"], "type", "vlan", "id", str(v["id"]))
+        if v.get("mtu"):
+            quiet("ip", "link", "set", v["dev"], "mtu", str(v["mtu"]))
+        if v["up"]:
+            quiet("ip", "link", "set", v["dev"], "up")
+        addrs(v["dev"], v["addrs"])
+    routes(ifn, snap["routes"])
+    for v in snap["vlans"]:
+        routes(v["dev"], v["routes"])
+
+
+def set_media_regs(bdf, media):
+    b = PciBar(bdf)
+    ce, cs = b.rd(CTRL_EXT), b.rd(CONNSW)
+    if media == "copper":
+        b.wr(CTRL_EXT, ce & ~LINK_MODE_SERDES)          # internal copper PHY
+        b.wr(CONNSW, cs & ~CONNSW_PHY_PDN)              # power copper PHY up
+        b.wr(MDICNFG, 0)                                # internal MDIO
+    else:
+        b.wr(CTRL_EXT, (ce & ~LINK_MODE_SERDES) | LINK_MODE_SERDES)
+        b.wr(CONNSW, cs | CONNSW_PHY_PDN)
+    b.close()
+
+
+def switch_media(cfg, bdf, media):
+    ifn = pci_netdev(bdf)
+    snap = save_netcfg(ifn) if ifn else None
+    if ifn:
+        with open(IGB + "/unbind", "w") as f:
+            f.write(bdf)
+    set_media_regs(bdf, media)
+    with open(IGB + "/bind", "w") as f:
+        f.write(bdf)
+    for _ in range(30):
+        if pci_netdev(bdf):
+            break
+        time.sleep(0.1)
+    try:
+        apply_names(cfg)
+    except RuntimeError as e:
+        log(f"ERROR renaming interfaces: {e}", err=True)
+    new = pci_netdev(bdf)
+    if snap and new:
+        restore_netcfg(snap, new)
+    elif new:
+        sh("ip", "link", "set", new, "up")
+    log(f"{new or bdf}: media -> {media.upper()} ({'SFP module present' if media == 'sfp' else 'no SFP module'})")
+
+
+def media_apply_once(cfg):
+    for bdf, pol in cfg.media.items():
+        if not os.path.exists(f"/sys/bus/pci/devices/{bdf}"):
+            continue
+        present = sfp_present(bdf)
+        want = wanted_media(pol, bool(present))
+        cur = current_media(bdf)
+        if cur != want:
+            switch_media(cfg, bdf, want)
+
+
+def cmd_media(args):
+    cfg = Cfg()
+    print(f"{'PORT':6}{'PCI':14}{'POLICY':8}{'SFP':9}{'MEDIA':8}{'WANT':8}LINK")
+    for bdf in I350_PORTS:
+        pol = cfg.media.get(bdf, "-")
+        pr = sfp_present(bdf)
+        cur = current_media(bdf)
+        want = wanted_media(pol, bool(pr)) if pol != "-" else "-"
+        print(f"{pci_netdev(bdf) or '-':6}{bdf:14}{pol:8}"
+              f"{'?' if pr is None else ('present' if pr else 'empty'):9}{cur or '-':8}{want:8}"
+              f"{'yes' if has_link(bdf) else 'no'}")
+    if args.set:
+        n, media = args.set.split("=")
+        bdf = dict((nm, b) for b, nm in cfg.names).get(n)
+        if bdf not in I350_PORTS or media not in ("sfp", "copper"):
+            die("--set expects eth0|eth1=sfp|copper")
+        switch_media(cfg, bdf, media)
+    return 0
+
+
+def cmd_media_watch(args):
+    """Daemon: switch a GE port between SFP and copper when an SFP is inserted/removed."""
+    cfg = Cfg()
+    auto = [b for b, p in cfg.media.items() if p == "auto"]
+    log(f"media-watch: auto ports {[pci_netdev(b) or b for b in auto] or 'none'}, poll {cfg.media_poll}s")
+    last, stable, hold = {}, {}, {}
+    while True:
+        now = time.time()
+        for bdf in auto:
+            pr = sfp_present(bdf)
+            if pr is None:
+                continue
+            stable[bdf] = stable.get(bdf, 0) + 1 if last.get(bdf) == pr else 1
+            last[bdf] = pr
+            if stable[bdf] < 2 or now < hold.get(bdf, 0):          # debounce + hold-down
+                continue
+            want = wanted_media("auto", pr)
+            cur = current_media(bdf)
+            if cur and cur != want:
+                try:
+                    switch_media(cfg, bdf, want)
+                except Exception as e:
+                    log(f"{bdf}: media switch failed: {e}", err=True)
+                hold[bdf] = time.time() + 10
+        time.sleep(cfg.media_poll)
+
+
 def cmd_up(args):
     check_hw()
     cfg = Cfg()
@@ -397,6 +677,10 @@ def cmd_up(args):
         apply_names(cfg)
     except RuntimeError as e:
         log(f"ERROR renaming interfaces: {e}", err=True)
+    try:
+        media_apply_once(cfg)
+    except Exception as e:
+        log(f"ERROR applying GE/SFP media: {e}", err=True)
     for bdf, want in cfg.names:
         log(f"  {bdf} -> {pci_netdev(bdf) or '-'}")
     return 0
@@ -502,6 +786,10 @@ def main():
                    help="briefly unbind a switch's uplink port to read it (drops its LANs ~2s)")
     p.add_argument("--detail", action="store_true", help="also show PHY/SerDes registers")
     p.set_defaults(f=cmd_status)
+    p = sub.add_parser("media", help="GE/SFP combo ports: SFP present, current media, link")
+    p.add_argument("--set", metavar="ethX=sfp|copper", help="force a media switch now (one-off)")
+    p.set_defaults(f=cmd_media)
+    sub.add_parser("media-watch", help="daemon: auto-switch GE/SFP on SFP insert/remove").set_defaults(f=cmd_media_watch)
     p = sub.add_parser("watch", help="live PHY link monitor")
     p.add_argument("switch", nargs="?", default="A", help="A (default) or B")
     p.set_defaults(f=cmd_watch)

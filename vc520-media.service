@@ -1,0 +1,14 @@
+[Unit]
+Description=VeloCloud Edge 520 GE/SFP combo port auto media switching
+Documentation=file:///usr/local/share/doc/vc520-ports/README.md
+After=vc520-ports.service
+Requires=vc520-ports.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vc520-ports media-watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

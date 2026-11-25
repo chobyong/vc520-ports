@@ -8,17 +8,35 @@ After a fresh Turnium install only `eth0`/`eth1` appear. This package brings up 
 
 | Front port | Hardware path | Linux name |
 |---|---|---|
-| GE1 / SFP1 | Intel I350 `04:00.0` | **`eth0`** (SFP works; RJ45 copper not yet) |
-| GE2 / SFP2 | Intel I350 `04:00.1` | **`eth1`** (SFP works; RJ45 copper not yet) |
+| GE1 / SFP1 | Intel I350 `04:00.0`: SerDes → SFP1, built-in copper PHY → GE1 | **`eth0`**, auto SFP/copper (see below) |
+| GE2 / SFP2 | Intel I350 `04:00.1`: SerDes → SFP2, built-in copper PHY → GE2 | **`eth1`**, default `sfp` |
 | LAN1–LAN4 | 88E6176 **switch B** ports 0–3 → port 4 SerDes → I354 `00:14.1` | **`eth2`** |
 | LAN5–LAN8 | 88E6176 **switch A** ports 0–3 → port 4 SerDes → I354 `00:14.0` | **`eth3`** |
-| — | I354 `00:14.2`, no front port found | `eth4` (unused) |
+| — | I354 `00:14.2`, no front port found | not bound (no `eth4`) |
 | — | I354 `00:14.3`, left unbound to manage switch A | — |
 
 Names are set **by PCI address** after binding (`NAMES` in `/etc/default/vc520-ports`). The rename is done in two steps, so it works whatever order the kernel found the ports in.
 
 Each switch behaves as an **unmanaged switch**. 802.1Q tags pass through unchanged, so in Turnium use `eth2` / `eth3` or VLAN subinterfaces `eth2.<vid>` / `eth3.<vid>`.
 Configure them as LAN / Connected-IP interfaces, **not as legs**.
+
+## GE / SFP combo ports (v0.4)
+
+GE1/SFP1 and GE2/SFP2 each share one I350 port. That port runs either the **SerDes** (SFP) or its **built-in copper PHY** (RJ45), never both. Set the mode per port in `/etc/default/vc520-ports`:
+
+```bash
+GE_MEDIA="eth0=auto eth1=sfp"     # auto | sfp | copper
+```
+
+- `auto`: SFP module present → SFP, cage empty → GE copper. `vc520-media.service` polls the SFP-present pin (I350 `SDP0`, 1 = absent) every `MEDIA_POLL` seconds. On a change it re-binds that port in the new mode, and restores its IP addresses, routes and VLAN subinterfaces. The port drops for about 3 s.
+- The I350 NVM doesn't enable `igb`'s own Media Auto-Sense (MAS), so the tool does the switching instead.
+- `eth1` defaults to `sfp` so the WAN on SFP2 isn't touched until `auto` has been tested on `eth0`.
+
+```bash
+vc520-ports media                    # SFP present / current media / link for eth0 and eth1
+vc520-ports media --set eth0=copper  # one-off manual switch
+journalctl -u vc520-media -f         # watch auto switching
+```
 
 ## Why it's needed
 
@@ -50,12 +68,15 @@ journalctl -u vc520-ports -b
 
 ## Known gaps
 
-- [ ] **GE1/GE2 RJ45 copper**: no link yet. Candidates: I354 `00:14.2`/`.3` own MDIO buses, or the switches' RGMII ports 5/6.
+- [ ] **GE1/GE2 copper link** not yet confirmed. The I350 copper PHY is found (ID `0154:03b1`) and `igb` runs in copper mode. If the RJ45 still has no link, a media mux pin (SDP1/SDP3) may be needed.
+- [ ] Confirm that SDP0 really is SFP-present (insert/remove a module, then run `vc520-ports media`).
 - [ ] Exact jack → port labels (only LAN6 = switch A port 0 confirmed). Edit `LABELS_A` / `LABELS_B`.
 - [ ] Optional per-port access VLANs (88E6176 VTU).
 - [ ] Pin interface names with systemd `.link` files.
 
 ## Changelog
+
+- **0.4.0**: GE/SFP combo ports with `auto`/`sfp`/`copper` per port, plus the `vc520-media.service` auto-switch daemon. Adds the `media` command. `00:14.2` is no longer bound, so there's no `eth4`.
 
 - **0.3.0**: Fixed names: `eth0`=GE1/SFP1, `eth1`=GE2/SFP2, `eth2`=LAN1–4, `eth3`=LAN5–8 (two-step rename by PCI address). The boot path recovers if `igb` grabbed I354 ports after a warm reboot.
 

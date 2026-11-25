@@ -1,17 +1,25 @@
-# /etc/default/vc520-ports  (vc520-ports 0.3.x)
+# /etc/default/vc520-ports  (vc520-ports 0.4.x)
 
 # I354 functions (00:14.N) to bind to igb (bind order; final names come from NAMES)
-#   1 = switch B uplink (LAN1-LAN4)   0 = switch A uplink (LAN5-LAN8)   2 = unused
-BIND_FNS="1 0 2"
+#   1 = switch B uplink (LAN1-LAN4)   0 = switch A uplink (LAN5-LAN8)
+#   (00:14.2 is not bound -> no eth4.  Add "2" here and to NAMES if you want it back.)
+BIND_FNS="1 0"
 
 # Final interface names by PCI address
-NAMES="0000:04:00.0=eth0 0000:04:00.1=eth1 0000:00:14.1=eth2 0000:00:14.0=eth3 0000:00:14.2=eth4"
+NAMES="0000:04:00.0=eth0 0000:04:00.1=eth1 0000:00:14.1=eth2 0000:00:14.0=eth3"
+
+# GE1/SFP1 (eth0) and GE2/SFP2 (eth1) combo ports:  auto | sfp | copper
+#   auto   = SFP module inserted -> SFP, cage empty -> GE RJ45 copper
+#            (vc520-media.service watches for insert/remove; port blips ~3 s on a switch)
+#   sfp    = always SFP          copper = always GE RJ45
+# eth1 defaults to "sfp" so a WAN on SFP2 is never touched until auto is proven on eth0.
+GE_MEDIA="eth0=auto eth1=sfp"
+MEDIA_POLL=3
 
 # Switches  name:I354-fn:MDICNFG   (fn whose MDIO bus reaches that switch)
 SWITCHES="A:0:0xc0000000 B:1:0x80000000"
 
 # Management path while the switch's own port is bound (must be an UNBOUND fn).
-# Switch A is on the shared bus, so 00:14.3 reaches it. No alternate known for B.
 SWITCH_MGMT="A:3:0xc0000000"
 
 # Front-panel labels per switch port (4 = SerDes uplink). Fill in as mapped.
