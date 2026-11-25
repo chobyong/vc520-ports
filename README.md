@@ -21,7 +21,7 @@ After a fresh Turnium install only `eth0`/`eth1` appear. This package brings up 
 ## Install
 
 ```bash
-git clone https://github.com/<org>/vc520-ports.git   # or copy the release tarball
+git clone https://github.com/chobyong/vc520-ports.git   # or copy the release tarball
 cd vc520-ports
 sudo ./install.sh --now
 ```
