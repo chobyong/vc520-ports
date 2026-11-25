@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install vc520-ports on a VeloCloud Edge 520 running Debian 12 / Turnium.
+# Install / upgrade vc520-ports on a VeloCloud Edge 520 running Debian 12 / Turnium.
 #   ./install.sh          install + enable at boot
 #   ./install.sh --now    also run it immediately
 set -euo pipefail
@@ -12,6 +12,7 @@ install -m 0755 vc520-ports         /usr/local/sbin/vc520-ports
 install -m 0644 vc520-ports.service /etc/systemd/system/vc520-ports.service
 install -d /usr/local/share/doc/vc520-ports
 install -m 0644 README.md           /usr/local/share/doc/vc520-ports/README.md
+install -m 0644 vc520-ports.default /etc/default/vc520-ports.example
 [ -f /etc/default/vc520-ports ] || install -m 0644 vc520-ports.default /etc/default/vc520-ports
 
 systemctl daemon-reload
