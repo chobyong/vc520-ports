@@ -3,17 +3,17 @@
 vc520-ports - enable the LAN switches and I354 ports on a VeloCloud Edge 520
 running Debian 12 / Turnium SD-WAN.
 
-Hardware map (verified on a VC520):
-  SFP1 / SFP2   Intel I350 fiber (04:00.0/.1)          -> eth0 / eth1  (work out of the box)
-  GE1 / GE2     RJ45 copper                             -> NOT YET SUPPORTED
-  LAN5-LAN8     88E6176 switch A, PHY ports 0-3
-                -> port 4 SerDes -> I354 00:14.0        -> eth2
-                switch A reached via the SHARED I354 MDIO bus (MDICNFG 0xc0000000)
-  LAN1-LAN4     88E6176 switch B, PHY ports 0-3
-                -> port 4 SerDes -> I354 00:14.1        -> eth3
-                switch B reached via I354 00:14.1's OWN MDIO bus (MDICNFG 0x80000000)
-  00:14.2       I354, no front port found               -> eth4 (bound, unused)
-  00:14.3       I354, left UNBOUND as management path to switch A
+Hardware map (verified on a VC520) and interface names set by this tool:
+  eth0  I350 04:00.0          SFP1  (GE1 RJ45 copper: not working yet)
+  eth1  I350 04:00.1          SFP2  (GE2 RJ45 copper: not working yet)
+  eth2  I354 00:14.1  <- 88E6176 switch B port 4 SerDes <- LAN1-LAN4 (switch B ports 0-3)
+        switch B is on 00:14.1's OWN MDIO bus (MDICNFG 0x80000000)
+  eth3  I354 00:14.0  <- 88E6176 switch A port 4 SerDes <- LAN5-LAN8 (switch A ports 0-3)
+        switch A is on the SHARED I354 MDIO bus (MDICNFG 0xc0000000)
+  eth4  I354 00:14.2  (no front port found)
+  --    I354 00:14.3  left UNBOUND as management path to switch A
+Names are applied by PCI address after binding (two-phase rename), so they do not
+depend on probe order.
 
 Problems this fixes at boot:
   1. igb fails on the I354 ports ("probe failed with error -2", "MDI Error"):
@@ -26,13 +26,13 @@ Problems this fixes at boot:
 
 Linux blocks register access to a PCI function owned by igb, so a switch can only be
 managed through an UNBOUND I354 port wired to its MDIO bus. Switch B's only known
-path is 00:14.1 (= eth3); 'status --force' briefly unbinds eth3 to read it.
+path is 00:14.1 (= eth2); 'status --force' briefly unbinds eth2 to read it.
 
 Config: /etc/default/vc520-ports
 """
 import argparse, mmap, os, struct, sys, time, syslog
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEV = "/sys/bus/pci/devices/0000:00:14.{}"
 IGB = "/sys/bus/pci/drivers/igb"
 I350_PORT0 = "/sys/bus/pci/devices/0000:04:00.0"
@@ -45,13 +45,15 @@ MDICNFG_SHARED = 0xC0000000                          # external + common MDIO
 G1, G2 = 0x1B, 0x1C
 
 DEFAULTS = {
-    "BIND_FNS": "0 1 2",
+    "BIND_FNS": "1 0 2",
+    # final interface names by PCI address (applied after binding, any boot order)
+    "NAMES": "0000:04:00.0=eth0 0000:04:00.1=eth1 0000:00:14.1=eth2 0000:00:14.0=eth3 0000:00:14.2=eth4",
     # name:fn:MDICNFG  - the I354 port whose MDIO bus reaches the switch
     "SWITCHES": "A:0:0xc0000000 B:1:0x80000000",
     # alternate management path used once the switch's own port is bound
     "SWITCH_MGMT": "A:3:0xc0000000",
-    "LABELS_A": "0:LAN6 1:LAN-A1 2:LAN-A2 3:LAN-A3 4:uplink-eth2 5:rgmii5 6:rgmii6",
-    "LABELS_B": "0:LAN-B0 1:LAN-B1 2:LAN-B2 3:LAN-B3 4:uplink-eth3 5:rgmii5 6:rgmii6",
+    "LABELS_A": "0:LAN6 1:LAN-A1 2:LAN-A2 3:LAN-A3 4:uplink-eth3 5:rgmii5 6:rgmii6",
+    "LABELS_B": "0:LAN-B0 1:LAN-B1 2:LAN-B2 3:LAN-B3 4:uplink-eth2 5:rgmii5 6:rgmii6",
 }
 
 
@@ -90,6 +92,10 @@ class Cfg:
         self.bind = [int(x) for x in raw["BIND_FNS"].split()]
         self.switches = self._paths(raw["SWITCHES"])
         self.mgmt = self._paths(raw.get("SWITCH_MGMT", ""))
+        self.names = []
+        for item in raw.get("NAMES", "").split():
+            bdf, n = item.split("=")
+            self.names.append((bdf if bdf.startswith("0000:") else "0000:" + bdf, n))
         self.labels = {}
         for name in self.switches:
             lab = {p: f"port{p}" for p in range(7)}
@@ -300,29 +306,99 @@ def bind_kx(fn, mdicnfg):
     return None, "bound but no netdev"
 
 
+def run(*cmd):
+    import subprocess
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)}: {r.stderr.strip()}")
+
+
+def pci_netdev(bdf):
+    try:
+        return os.listdir(f"/sys/bus/pci/devices/{bdf}/net")[0]
+    except (FileNotFoundError, IndexError):
+        return None
+
+
+def is_up(ifname):
+    try:
+        return int(open(f"/sys/class/net/{ifname}/flags").read(), 16) & 1 == 1
+    except FileNotFoundError:
+        return False
+
+
+def apply_names(cfg):
+    """Rename interfaces to NAMES (by PCI address). Two-phase, so swaps like eth2<->eth3 work."""
+    todo = []
+    for bdf, want in cfg.names:
+        cur = pci_netdev(bdf)
+        if cur and cur != want:
+            todo.append((bdf, cur, want))
+    if not todo:
+        return
+    targets = {w for _, _, w in todo}
+    moving = {c for _, c, _ in todo}
+    for _, _, w in todo:                      # move unrelated holders of target names aside
+        if os.path.exists(f"/sys/class/net/{w}") and w not in moving:
+            n = 5
+            while os.path.exists(f"/sys/class/net/eth{n}") or f"eth{n}" in targets:
+                n += 1
+            was = is_up(w)
+            run("ip", "link", "set", w, "down")
+            run("ip", "link", "set", w, "name", f"eth{n}")
+            if was:
+                run("ip", "link", "set", f"eth{n}", "up")
+            log(f"renamed {w} -> eth{n} (not in NAMES, moved aside)")
+    state = {}
+    for i, (bdf, cur, want) in enumerate(todo):
+        state[bdf] = is_up(cur)
+        run("ip", "link", "set", cur, "down")
+        run("ip", "link", "set", cur, "name", f"vc520tmp{i}")
+    for i, (bdf, cur, want) in enumerate(todo):
+        run("ip", "link", "set", f"vc520tmp{i}", "name", want)
+        if state[bdf]:
+            run("ip", "link", "set", want, "up")
+        log(f"renamed {cur} -> {want} ({bdf})")
+
+
 def cmd_up(args):
     check_hw()
     cfg = Cfg()
     wait_for_igb()
+    # management-only ports must be unbound (e.g. igb grabbed them after a warm reboot)
+    for fn in range(4):
+        if fn not in cfg.bind and is_bound(fn):
+            with open(IGB + "/unbind", "w") as f:
+                f.write(f"0000:00:14.{fn}")
+            log(f"00:14.{fn}: unbound (reserved for switch management)")
     # pin each unbound port's MDIO routing (warm reboots keep stale values)
     for fn in range(4):
         if not is_bound(fn):
             set_mdicnfg(fn, cfg.mdicnfg_for(fn))
     for name in cfg.switches:
-        sw, _ = open_switch(cfg, name)
+        sw, rebind = open_switch(cfg, name, force=True)
         if not sw:
-            log(f"switch {name}: not reachable (its I354 port already bound?) - skipped")
-            continue
-        try:
-            switch_up(sw)
-            log(f"switch {name}: enabled via 00:14.{sw.fn}")
-        finally:
-            sw.close()
+            log(f"switch {name}: NOT reachable - not enabled", err=True)
+        else:
+            try:
+                switch_up(sw)
+                log(f"switch {name}: enabled via 00:14.{sw.fn}")
+            finally:
+                sw.close()
+        if rebind is not None:
+            n, msg = bind_kx(rebind, cfg.mdicnfg_for(rebind))
+            log(f"00:14.{rebind}: {n or '-'} {msg}", err=n is None)
     for fn in cfg.bind:
         n, msg = bind_kx(fn, cfg.mdicnfg_for(fn))
         log(f"00:14.{fn}: {n or '-'} {msg}", err=n is None)
         if n:
             os.system(f"ip link set {n} up")
+    try:
+        apply_names(cfg)
+    except RuntimeError as e:
+        log(f"ERROR renaming interfaces: {e}", err=True)
+    for bdf, want in cfg.names:
+        log(f"  {bdf} -> {pci_netdev(bdf) or '-'}")
     return 0
 
 
@@ -378,7 +454,11 @@ def cmd_status(args):
             n, msg = bind_kx(rebind, cfg.mdicnfg_for(rebind))
             if n:
                 os.system(f"ip link set {n} up")
-            print(f"  (rebound 00:14.{rebind} -> {n}: {msg})")
+            try:
+                apply_names(cfg)
+            except RuntimeError as e:
+                log(f"ERROR renaming interfaces: {e}", err=True)
+            print(f"  (rebound 00:14.{rebind} -> {pci_netdev('0000:00:14.%d' % rebind)}: {msg})")
     return 0
 
 
