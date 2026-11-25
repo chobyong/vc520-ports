@@ -1,0 +1,15 @@
+[Unit]
+Description=VeloCloud Edge 520 LAN switch and I354 port enablement
+Documentation=file:///usr/local/share/doc/vc520-ports/README.md
+After=local-fs.target systemd-udev-trigger.service systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vc520-ports up
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

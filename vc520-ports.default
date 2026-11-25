@@ -1,0 +1,8 @@
+# /etc/default/vc520-ports
+# I354 functions (00:14.N) to bind to igb. Binding order sets names: first -> eth2, ...
+#   0 = uplink to the 88E6176 LAN switch (LAN1-LAN6 traffic arrives here)
+#   1,2 = not wired to a front port on the VC520 as far as tested
+BIND_FNS="0 1 2"
+# I354 function left UNBOUND so the switch stays reachable over MDIO
+# (needed by 'vc520-ports status|watch' and future VLAN config)
+MGMT_FN=3

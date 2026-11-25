@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+vc520-ports - enable the LAN switch and I354 ports on a VeloCloud Edge 520
+running Debian 12 / Turnium SD-WAN.
+
+Hardware (as found on the VC520):
+  eth0/eth1  Intel I350 (04:00.0/.1)   -> GE1 / GE2 (RJ45/SFP combo). Work out of the box.
+  00:14.0-3  Intel I354 (Atom C2000)   -> igb probe fails "error -2" (MDI Error):
+             NVM says SGMII + external MDIO PHY at addr 0, but no PHY answers there.
+  00:14.0    I354 port 0 <-> Marvell 88E6176 switch port 4 (SerDes, 1000BASE-X)
+  88E6176    single-chip mode at SMI 0x10-0x16; after reset all ports DISABLED and
+             all PHYs + SerDes POWERED DOWN (VeloCloud firmware normally enables them).
+
+What "up" does (idempotent, safe to re-run):
+  1. Waits for igb to have bound the I350 ports (eth0/eth1 keep their names).
+  2. Through an UNBOUND I354 port's MDIO master, powers up switch PHYs 0-4 and
+     the SerDes, and sets all 7 switch ports to Forwarding (unmanaged switch).
+  3. Switches the selected I354 ports to 1000BASE-KX link mode (no PHY needed)
+     and binds them to igb -> eth2, eth3, ...
+
+One I354 port (MGMT_FN, default 3) is deliberately left unbound so the switch
+stays reachable over MDIO for 'status', 'watch' and future VLAN config
+(the kernel blocks register access to ports owned by igb).
+
+Config: /etc/default/vc520-ports   (BIND_FNS="0 1 2"  MGMT_FN=3)
+"""
+import argparse, mmap, os, struct, sys, time, syslog
+
+VERSION = "0.1.0"
+DEV = "/sys/bus/pci/devices/0000:00:14.{}"
+IGB = "/sys/bus/pci/drivers/igb"
+I350_PORT0 = "/sys/bus/pci/devices/0000:04:00.0"
+I354_ID = ("0x8086", "0x1f41")
+SWITCH_ID_MASK, SWITCH_ID = 0xFFF0, 0x1760          # 88E6176 (0x1761 = rev 1)
+
+CTRL_EXT, MDIC, MDICNFG = 0x18, 0x20, 0x0E04
+LINK_MODE_MASK, LINK_MODE_KX, I2C_ENA = 0x00C00000, 0x00400000, 0x02000000
+G1, G2 = 0x1B, 0x1C
+
+
+def log(msg, err=False):
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
+    try:
+        syslog.syslog(syslog.LOG_ERR if err else syslog.LOG_INFO, msg)
+    except Exception:
+        pass
+
+
+def die(msg):
+    log("ERROR: " + msg, err=True)
+    sys.exit(1)
+
+
+def h(v):
+    return "----" if v is None else f"{v:04x}"
+
+
+def bit(v, n, w=1):
+    return "?" if v is None else (v >> n) & ((1 << w) - 1)
+
+
+# ---------------------------------------------------------------- PCI helpers
+def is_bound(fn):
+    return os.path.exists(DEV.format(fn) + "/driver")
+
+
+def netdev(fn):
+    try:
+        return os.listdir(DEV.format(fn) + "/net")[0]
+    except (FileNotFoundError, IndexError):
+        return None
+
+
+def sysfs_write(path, val):
+    with open(path, "w") as f:
+        f.write(val)
+
+
+class Bar:
+    """Direct BAR0 register access to an (unbound) I354 function."""
+
+    def __init__(self, fn):
+        if is_bound(fn):
+            die(f"00:14.{fn} is bound to a driver; its registers are not accessible")
+        self.fd = os.open(DEV.format(fn) + "/resource0", os.O_RDWR | os.O_SYNC)
+        self.m = mmap.mmap(self.fd, 0x20000)
+
+    def rd(self, o):
+        return struct.unpack_from("<I", self.m, o)[0]
+
+    def wr(self, o, v):
+        struct.pack_into("<I", self.m, o, v)
+
+    def close(self):
+        self.m.close()
+        os.close(self.fd)
+
+
+class Switch:
+    """88E6176 access via the I354 MDIO master (MDIC), clause-22, single-chip mode."""
+
+    def __init__(self, fn):
+        self.bar = Bar(fn)
+        self.cfg0 = self.bar.rd(MDICNFG)
+
+    def smi(self, addr, reg, val=None):
+        b = self.bar
+        op = 1 if val is not None else 2
+        for _ in range(10):
+            b.wr(MDICNFG, (self.cfg0 & ~0x03E00000) | (addr << 21))
+            b.wr(MDIC, (reg << 16) | (addr << 21) | (op << 26) | ((val or 0) & 0xFFFF))
+            for _ in range(2000):
+                v = b.rd(MDIC)
+                if v & (1 << 28):
+                    break
+            else:
+                continue
+            if v & (1 << 30):
+                time.sleep(0.001)
+                continue
+            return v & 0xFFFF
+        return None
+
+    def g2wait(self):
+        for _ in range(200):
+            v = self.smi(G2, 0x18)
+            if v is not None and not v & 0x8000:
+                return
+
+    def phy_rd(self, dev, reg):
+        self.g2wait()
+        self.smi(G2, 0x18, 0x9800 | (dev << 5) | reg)
+        self.g2wait()
+        return self.smi(G2, 0x19)
+
+    def phy_wr(self, dev, reg, val):
+        self.g2wait()
+        self.smi(G2, 0x19, val)
+        self.smi(G2, 0x18, 0x9400 | (dev << 5) | reg)
+        self.g2wait()
+
+    def ident(self):
+        return self.smi(0x10, 3)
+
+    def close(self):
+        self.bar.wr(MDICNFG, self.cfg0)
+        self.bar.close()
+
+
+# ---------------------------------------------------------------- config
+def load_cfg():
+    cfg = {"BIND_FNS": "0 1 2", "MGMT_FN": "3"}
+    path = "/etc/default/vc520-ports"
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    bind = [int(x) for x in cfg["BIND_FNS"].split()]
+    mgmt = int(cfg["MGMT_FN"])
+    if mgmt in bind:
+        die("MGMT_FN must not be in BIND_FNS")
+    return bind, mgmt
+
+
+def check_hw():
+    for fn in range(4):
+        d = DEV.format(fn)
+        try:
+            ids = (open(d + "/vendor").read().strip(), open(d + "/device").read().strip())
+        except FileNotFoundError:
+            die(f"00:14.{fn} not present - is this a VeloCloud Edge 520?")
+        if ids != I354_ID:
+            die(f"00:14.{fn} is {ids}, expected Intel I354 {I354_ID}")
+
+
+def wait_for_igb(timeout=60):
+    t0 = time.time()
+    if not os.path.isdir(IGB):
+        os.system("modprobe igb")
+    while time.time() - t0 < timeout:
+        # igb has run its initial probe once the I350 port is bound
+        if os.path.isdir(IGB) and (not os.path.exists(I350_PORT0) or is_bound_path(I350_PORT0)):
+            return
+        time.sleep(1)
+    log("WARNING: igb did not bind the I350 within timeout; continuing", err=True)
+
+
+def is_bound_path(p):
+    return os.path.exists(p + "/driver")
+
+
+# ---------------------------------------------------------------- actions
+def switch_up(sw):
+    for p in range(5):                                  # copper PHYs
+        sw.phy_wr(p, 22, 0)                              # page 0
+        r16 = sw.phy_rd(p, 16)
+        if r16 is not None and r16 & 0x0004:             # copper-specific power-down
+            sw.phy_wr(p, 16, r16 & ~0x0004)
+        r0 = sw.phy_rd(p, 0)
+        if r0 is not None:
+            sw.phy_wr(p, 0, (r0 & ~0x0800) | 0x8000)     # clear BMCR PDOWN + soft reset
+    sw.phy_wr(0x0F, 22, 1)                               # SerDes page 1
+    r0 = sw.phy_rd(0x0F, 0)
+    if r0 is not None:
+        sw.phy_wr(0x0F, 0, (r0 & ~0x0800) | 0x8000)
+    sw.phy_wr(0x0F, 22, 0)
+    for p in range(7):                                   # all ports -> Forwarding
+        c = sw.smi(0x10 + p, 4)
+        if c is not None and c & 3 != 3:
+            sw.smi(0x10 + p, 4, (c & ~3) | 3)
+
+
+def bind_kx(fn):
+    if is_bound(fn):
+        return netdev(fn), "already bound"
+    b = Bar(fn)
+    ce = b.rd(CTRL_EXT)
+    b.wr(CTRL_EXT, (ce & ~(LINK_MODE_MASK | I2C_ENA)) | LINK_MODE_KX)
+    b.close()
+    try:
+        sysfs_write(IGB + "/bind", f"0000:00:14.{fn}")
+    except OSError as e:
+        return None, f"bind failed: {e}"
+    for _ in range(20):
+        n = netdev(fn)
+        if n:
+            return n, "bound (1000BASE-KX)"
+        time.sleep(0.1)
+    return None, "bound but no netdev"
+
+
+def open_switch(mgmt, bind):
+    for fn in [mgmt] + [f for f in range(4) if f not in bind and f != mgmt] + bind:
+        if not is_bound(fn):
+            sw = Switch(fn)
+            ident = sw.ident()
+            if ident is not None and ident & SWITCH_ID_MASK == SWITCH_ID:
+                return sw, fn
+            sw.close()
+    return None, None
+
+
+def cmd_up(args):
+    check_hw()
+    bind, mgmt = load_cfg()
+    wait_for_igb()
+    sw, via = open_switch(mgmt, bind)
+    if sw:
+        try:
+            switch_up(sw)
+            log(f"88E6176 enabled (PHYs/SerDes powered, ports forwarding) via 00:14.{via}")
+        finally:
+            sw.close()
+    else:
+        log("WARNING: 88E6176 not reachable (no unbound I354 port answered); "
+            "switch not configured", err=True)
+    for fn in bind:
+        n, msg = bind_kx(fn)
+        log(f"00:14.{fn}: {n or '-'} {msg}", err=n is None)
+        if n:
+            os.system(f"ip link set {n} up")
+    return 0
+
+
+def cmd_status(args):
+    check_hw()
+    bind, mgmt = load_cfg()
+    print(f"vc520-ports {VERSION}")
+    for fn in range(4):
+        print(f" 00:14.{fn}: {'bound -> ' + str(netdev(fn)) if is_bound(fn) else 'unbound'}")
+    sw, via = open_switch(mgmt, bind)
+    if not sw:
+        die("switch not reachable - need one unbound I354 port (MGMT_FN)")
+    try:
+        print(f"Switch ID={h(sw.ident())} G1status={h(sw.smi(G1, 0))} (via 00:14.{via})")
+        for p in range(7):
+            s, c4, vm = (sw.smi(0x10 + p, r) for r in (0, 4, 6))
+            print(f" port{p}: STS={h(s)} PCTL={h(c4)} VMAP={h(vm)} link={bit(s, 11)} "
+                  f"fd={bit(s, 10)} spd={bit(s, 8, 2)} cmode={bit(s, 0, 4)} state={bit(c4, 0, 2)}")
+        for p in range(5):
+            r0 = sw.phy_rd(p, 0)
+            sw.phy_rd(p, 1)
+            r1 = sw.phy_rd(p, 1)
+            r17 = sw.phy_rd(p, 17)
+            print(f" phy{p}: ctl={h(r0)} sts={h(r1)} cssr={h(r17)} pwrdn={bit(r0, 11)} "
+                  f"link={bit(r17, 10)}")
+        sw.phy_wr(0x0F, 22, 1)
+        r0 = sw.phy_rd(0x0F, 0)
+        sw.phy_rd(0x0F, 1)
+        r1 = sw.phy_rd(0x0F, 1)
+        sw.phy_wr(0x0F, 22, 0)
+        print(f" serdes: ctl={h(r0)} sts={h(r1)} pwrdn={bit(r0, 11)} link={bit(r1, 2)}")
+    finally:
+        sw.close()
+    return 0
+
+
+def cmd_watch(args):
+    bind, mgmt = load_cfg()
+    sw, via = open_switch(mgmt, bind)
+    if not sw:
+        die("switch not reachable - need one unbound I354 port (MGMT_FN)")
+    last = None
+    print("watching switch PHY link (Ctrl-C to stop)")
+    try:
+        while True:
+            st = []
+            for p in range(5):
+                r17 = sw.phy_rd(p, 17)
+                st.append(f"phy{p}:{'UP' if r17 not in (None, 0xFFFF) and r17 & 0x400 else '--'}")
+            line = "  ".join(st)
+            if line != last:
+                print(time.strftime("%T"), line, flush=True)
+                last = line
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sw.close()
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        die("must run as root")
+    ap = argparse.ArgumentParser(description="VeloCloud Edge 520 LAN switch / I354 enablement")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("up", help="enable switch and bind I354 ports (boot-time)").set_defaults(f=cmd_up)
+    sub.add_parser("status", help="show I354 binding and switch port/PHY state").set_defaults(f=cmd_status)
+    sub.add_parser("watch", help="live PHY link monitor").set_defaults(f=cmd_watch)
+    args = ap.parse_args()
+    sys.exit(args.f(args))
+
+
+if __name__ == "__main__":
+    main()
