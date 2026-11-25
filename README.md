@@ -29,7 +29,7 @@ Configure them as LAN / Connected-IP interfaces, **not as legs**.
 ## Install / upgrade
 
 ```bash
-git clone https://github.com/<org>/vc520-ports.git && cd vc520-ports   # or: git pull
+git clone https://github.com/chobyong/vc520-ports.git && cd vc520-ports   # or: git pull
 sudo ./install.sh --now
 ```
 
